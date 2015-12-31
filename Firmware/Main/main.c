@@ -22,6 +22,7 @@
 #include "rootdir.h"
 #include "sd_raw.h"
 #include "string_printf.h"
+#include "delay.h"
 
 
 /*******************************************************
@@ -31,10 +32,19 @@
 #define ON  1
 #define OFF 0
 
-#define buf_size 512
+#define BUF_SIZE 512
+#define ADR_START_BIT 0x01000000
+#define ADR_DONE_BIT  0x80000000
+#define BUTTON_PIN    0x00000008
 
-char RX_array1[buf_size];
-char RX_array2[buf_size];
+// Modes for LED flashing function
+#define ZERO 0
+#define ONE  1
+#define SEQUENCE 2
+#define SIMULTANEOUS 3
+
+char RX_array1[BUF_SIZE];
+char RX_array2[BUF_SIZE];
 char log_array1 = 0;
 char log_array2 = 0;
 short RX_in = 0;
@@ -93,8 +103,6 @@ void UNDEF_Routine(void) __attribute__ ((interrupt("UNDEF")));
 
 void fat_initialize(void);
 
-void delay_ms(int count);
-
 
 /*******************************************************
  *          MAIN
@@ -151,15 +159,23 @@ int main (void)
   }
   
   handle = root_open_new(name);
-    
 
   sd_raw_sync();  
     
-  if(mode == 0){ mode_0(); }
-  else if(mode == 1){ mode_1(); }
-  else if(mode == 2){ mode_2(); }
+  if(mode == 0)
+  {
+    mode_0();
+  }
+  else if(mode == 1)
+  {
+    mode_1();
+  }
+  else if(mode == 2)
+  {
+    mode_2();
+  }
 
-      return 0;
+  return 0;
 }
 
 
@@ -211,10 +227,10 @@ void Initialize(void)
   // P0.28  | 01    | AD0.1
   // P0.29  | 01    | AD0.2
   // P0.30  | 01    | AD0.3
-  // P0.31  | 00    | GPO Port only
+  // P0.31  | 01    | USB UP_LED
 
   PINSEL0 = 0xCF351505;
-  PINSEL1 = 0x15441801;
+  PINSEL1 = 0x55441801;
 
   // P0.0  = INPUT  | TXD (UART0)
   // P0.1  = INPUT  | RxD (UART0)
@@ -237,6 +253,40 @@ void Initialize(void)
 
 }
 
+// Flash Status Lights
+// Sequence modes:
+//  0: Flash 0
+//  1: Flash 1
+//  2: Flash in sequence
+//  3: Flash simultaneous
+void static inline flashLEDs(int flashMode, int delay)
+{
+  switch(mode)
+  {
+    case ZERO :
+    case  ONE :
+      stat(flashMode, ON);
+      delay_ms(delay);
+      stat(flashMode, OFF);
+      break;
+    case SEQUENCE :
+      stat(0,ON);
+      delay_ms(delay);
+      stat(0,OFF);
+      stat(1,ON);
+      delay_ms(delay);
+      stat(1,OFF);
+      break;
+    case SIMULTANEOUS :
+      stat(0, ON);
+      stat(1, ON);
+      delay_ms(delay);
+      stat(0, OFF);
+      stat(1, OFF);
+      break;
+  }
+}
+
 // Make values in PLL control & configure registers take effect 
 void feed(void)
 {
@@ -247,20 +297,20 @@ void feed(void)
 
 static void UART0ISR(void)
 {
-  if(RX_in < buf_size)
+  if(RX_in < BUF_SIZE)
   {
     RX_array1[RX_in] = U0RBR;
   
     RX_in++;
 
-    if(RX_in == buf_size) log_array1 = 1;
+    if(RX_in == BUF_SIZE) log_array1 = 1;
   }
-  else if(RX_in >= buf_size)
+  else if(RX_in >= BUF_SIZE)
   {
-    RX_array2[RX_in-buf_size] = U0RBR;
+    RX_array2[RX_in-BUF_SIZE] = U0RBR;
     RX_in++;
 
-    if(RX_in == 2 * buf_size)
+    if(RX_in == 2 * BUF_SIZE)
     {
       log_array2 = 1;
       RX_in = 0;
@@ -321,9 +371,10 @@ static void UART0ISR_2(void)
   VICVectAddr = 0;  // Acknowledge interrupt
 }
 
+// 
 static inline int pushValue(char* q, int ind, int value)
 {
-  char* p = q + ind;
+  char* p = q + ind;  // Edit buffer starting at ind offset
 
   if(asc == 'Y') // ASCII
   {
@@ -343,6 +394,31 @@ static inline int pushValue(char* q, int ind, int value)
   }
 }
 
+// ADxCR 0x00020FF00 = 0b 0000 0 000 00 1 0 000 0 11111111 00000000
+// Symbol | Value | Function
+// -------|-------|----------------------------------
+// SEL    | 0x00  | Selects which of the 8 AD pins are sampled (0x00 == 0x01)
+// CLKDIV | 0xFF  | APB clock (PCLK) is divided by (this value plus one)
+// BURST  | 0x00  | Conversions are software controlled and require 11 clocks
+// CLKS   | 0x00  | 11 clocks/sample => 10 bits of accuracy
+// RSVD   | 0x00  | Don't write ones
+// PDN    | 0x01  | The A/D converter is operational
+// RSVD   | 0x00  | Don't write ones
+// START  | 0x00  | No start
+// EDGE   | 0x00  | Nothing due to value of START
+// RSVD   | 0x00  | Don't write ones
+//
+// ADxCR (31 30 29:16 15:6 5:0)
+// Symbol  | Function
+// --------|----------------------------------
+// RSVD    | Don't write ones
+// RESULT  | 0 to 0x3FF => 0V to Vref
+// RSVD    | Don't write ones
+// OVERRUN | Data was lost in burst mode
+// DONE    | 1 when A/D conversion completes Cleared when this register is read
+
+// Read one 10-bit sample in software mode from selected channel.
+// Return ind if channel not selected.
 static int sample(char* q, int ind, volatile unsigned long* ADxCR,
                   volatile unsigned long* ADxDR, int mask, char adx_bit)
 {
@@ -351,12 +427,12 @@ static int sample(char* q, int ind, volatile unsigned long* ADxCR,
     int value = 0;
 
     *ADxCR = 0x00020FF00 | mask;
-    *ADxCR |= 0x01000000;  // start conversion
-    while((value & 0x80000000) == 0)
+    *ADxCR |= ADR_START_BIT;  // Start conversion
+    while((value & ADR_DONE_BIT) == 0)  // While ADC not done
     {
       value = *ADxDR;
     }
-    *ADxCR = 0x00000000;
+    *ADxCR = 0x00000000;  // Stop conversion
 
     // The upper ten of the lower sixteen bits of 'value' are the
     // result. The result itself is unsigned. Hence a cast to
@@ -374,18 +450,18 @@ static void MODE2ISR(void)
 {
   int ind = 0;
   int j;
-  char q[50];
+  char ADC_buff[50];
 
 
   T0IR = 1; // reset TMR0 interrupt
   
   for(j = 0; j < 50; j++)
   {
-    q[j] = 0;
+    ADC_buff[j] = 0;
   }
 
-
-#define SAMPLE(X, BIT) ind = sample(q, ind, &AD##X##CR, &AD##X##DR, 1 << BIT, ad##X##_##BIT)
+// Build up output c string with ADC values
+#define SAMPLE(X, BIT) ind = sample(ADC_buff, ind, &AD##X##CR, &AD##X##DR, 1 << BIT, ad##X##_##BIT)
   SAMPLE(1, 3);
   SAMPLE(0, 3);
   SAMPLE(0, 2);
@@ -398,62 +474,62 @@ static void MODE2ISR(void)
   
   for(j = 0; j < ind; j++)
   {
-    if(RX_in < buf_size)
+    if(RX_in < BUF_SIZE)
     {
-      RX_array1[RX_in] = q[j];
+      RX_array1[RX_in] = ADC_buff[j];
       RX_in++;
 
-      if(RX_in == buf_size) log_array1 = 1;
+      if(RX_in == BUF_SIZE) log_array1 = 1;
     }
-    else if(RX_in >= buf_size)
+    else if(RX_in >= BUF_SIZE)
     {
-      RX_array2[RX_in - buf_size] = q[j];
+      RX_array2[RX_in - BUF_SIZE] = ADC_buff[j];
       RX_in++;
 
-      if(RX_in == 2 * buf_size)
+      if(RX_in == 2 * BUF_SIZE)
       {
         log_array2 = 1;
         RX_in = 0;
       }
     }
   }
-  if(RX_in < buf_size)
+  if(RX_in < BUF_SIZE)
   {
     if(asc == 'N') { RX_array1[RX_in] = '$'; }
     else if(asc == 'Y'){ RX_array1[RX_in] = 13; }
     RX_in++;
 
-    if(RX_in == buf_size) log_array1 = 1;
+    if(RX_in == BUF_SIZE) log_array1 = 1;
   }
-  else if(RX_in >= buf_size)
+  else if(RX_in >= BUF_SIZE)
   {
     
-    if(asc == 'N') RX_array2[RX_in - buf_size] = '$';
-    else if(asc == 'Y'){ RX_array2[RX_in - buf_size] = 13; }
+    if(asc == 'N') RX_array2[RX_in - BUF_SIZE] = '$';
+    else if(asc == 'Y'){ RX_array2[RX_in - BUF_SIZE] = 13; }
     RX_in++;
     
-    if(RX_in == 2 * buf_size)
+    if(RX_in == 2 * BUF_SIZE)
     {
       log_array2 = 1;
       RX_in = 0;
     }
   }
-  if(RX_in < buf_size)
+  if(RX_in < BUF_SIZE)
   {
     if(asc == 'N') RX_array1[RX_in] = '$';
     else if(asc == 'Y'){ RX_array1[RX_in] = 10; }
     RX_in++;
 
-    if(RX_in == buf_size) log_array1 = 1;
+    if(RX_in == BUF_SIZE) log_array1 = 1;
   }
-  else if(RX_in >= buf_size)
+  else if(RX_in >= BUF_SIZE)
   {
     
-    if(asc == 'N') RX_array2[RX_in - buf_size] = '$';
-    else if(asc == 'Y'){ RX_array2[RX_in - buf_size] = 10; }
+    if(asc == 'N') RX_array2[RX_in - BUF_SIZE] = '$';
+    else if(asc == 'Y'){ RX_array2[RX_in - BUF_SIZE] = 10; }
     RX_in++;
     
-    if(RX_in == 2 * buf_size)
+    if(RX_in == 2 * BUF_SIZE)
     {
       log_array2 = 1;
       RX_in = 0;
@@ -560,17 +636,30 @@ void setup_uart0(int newbaud, char want_ints)
     U0IER = 0x00;
   }
 }
+
 void stat(int statnum, int onoff)
 {
   if(statnum) // Stat 1
   {
-    if(onoff){ IOCLR0 = 0x00000800; } // On
-    else { IOSET0 = 0x00000800; } // Off
+    if(onoff)
+    {
+      IOCLR0 = 0x00000800;  // On
+    }
+    else
+    {
+      IOSET0 = 0x00000800;  // Off
+    }
   }
   else // Stat 0 
   {
-    if(onoff){ IOCLR0 = 0x00000004; } // On
-    else { IOSET0 = 0x00000004; } // Off
+    if(onoff)
+    {
+      IOCLR0 = 0x00000004;  // On
+    }
+    else
+    {
+      IOSET0 = 0x00000004;  // Off
+    }
   }
 }
 
@@ -578,7 +667,6 @@ void Log_init(void)
 {
   int x, mark = 0, ind = 0;
   char temp, temp2 = 0, safety = 0;
-//  signed char handle;
 
   if(root_file_exists("LOGCON.txt"))
   {
@@ -735,20 +823,24 @@ void Log_init(void)
     else if((temp2 == 0)){ freq = 100; }
   }
   
-  if(safety == 'T'){ test(); }
+  if(safety == 'T')
+  {
+    test();
+  }
 
 }
 
-
+// Automatic UART logging
 void mode_0(void) // Auto UART mode
 {
   rprintf("MODE 0\n\r");
   setup_uart0(baud,1);
-  stringSize = buf_size;
+  stringSize = BUF_SIZE;
   mode_action();
   //rprintf("Exit mode 0\n\r");
 }
 
+// Triggered UART logging
 void mode_1(void)
 {
   rprintf("MODE 1\n\r");  
@@ -759,6 +851,7 @@ void mode_1(void)
   mode_action();
 }
 
+// ADC logging
 void mode_2(void)
 {
   rprintf("MODE 2\n\r");  
@@ -780,7 +873,7 @@ void mode_2(void)
 
   T0TCR = 0x00000001; // enable timer
 
-  stringSize = 512;
+  stringSize = BUF_SIZE;
   mode_action();
 }
 
@@ -799,7 +892,7 @@ void mode_action(void)
         while(1)
         {
           stat(0,ON);
-          for(j = 0; j < 500000; j++);
+          for(j = 0; j < 500000; j++);  // TODO: Are these being compiled out?
           stat(0,OFF);
           stat(1,ON);
           for(j = 0; j < 500000; j++);
@@ -818,6 +911,7 @@ void mode_action(void)
       
       if(fat_write_file(handle,(unsigned char *)RX_array2, stringSize) < 0)
       {
+        // TODO: Refactor this blink code & fix it
         while(1)
         {
           stat(0,ON);
@@ -834,18 +928,18 @@ void mode_action(void)
       log_array2 = 0;
     }
 
-    if((IOPIN0 & 0x00000008) == 0) // if button pushed, log file & quit
+    if((IOPIN0 & BUTTON_PIN) == 0) // if button pushed, log file & quit
     {
       VICIntEnClr = 0xFFFFFFFF;
 
-      if(RX_in < buf_size)
+      if(RX_in < BUF_SIZE)
       {
         fat_write_file(handle, (unsigned char *)RX_array1, RX_in);
         sd_raw_sync();
       }
-      else if(RX_in >= buf_size)
+      else if(RX_in >= BUF_SIZE)
       {
-        fat_write_file(handle, (unsigned char *)RX_array2, RX_in - buf_size);
+        fat_write_file(handle, (unsigned char *)RX_array2, RX_in - BUF_SIZE);
         sd_raw_sync();
       }
       while(1)
@@ -861,6 +955,7 @@ void mode_action(void)
   }
 }
 
+// ADC test that logs all of the ADCs
 void test(void)
 {
 
@@ -960,10 +1055,3 @@ void fat_initialize(void)
   }
 }
 
-void delay_ms(int count)
-{
-  int i;
-  count *= 10000;
-  for(i = 0; i < count; i++)
-    asm volatile ("nop");
-}
